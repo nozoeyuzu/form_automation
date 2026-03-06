@@ -1,1 +1,5 @@
 .env
+__pycache__/
+generated_code/
+screenshots/
+reports/
