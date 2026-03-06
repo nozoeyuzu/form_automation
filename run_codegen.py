@@ -25,6 +25,7 @@ import requests
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
+from fetch_html import fetch_rendered_html
 from slack_notifier import notify as slack_notify
 
 load_dotenv()
@@ -40,15 +41,30 @@ def log(msg: str, level: str = "INFO"):
     print(f"  {timestamp} {symbol} {msg}")
 
 
-def fetch_code_from_dify(company_url: str, contact_url: str) -> str:
+def load_sales_data(config_path: str = "") -> str:
+    """営業担当者データJSONを読み込んで文字列として返す"""
+    path = Path(config_path) if config_path else Path(__file__).parent / "config_example.json"
+    if not path.exists():
+        log(f"設定ファイルが見つかりません: {path}", "ERROR")
+        sys.exit(1)
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def fetch_code_from_dify(company_url: str, contact_url: str, sales_data: str = "", contact_html: str = "") -> str:
     """Dify ワークフローAPIを呼び出してPlaywrightコードを取得する"""
     endpoint = f"{DIFY_BASE_URL}/workflows/run"
     headers = {
         "Authorization": f"Bearer {DIFY_API_KEY}",
         "Content-Type": "application/json",
     }
+    inputs = {"company_url": company_url, "contact_url": contact_url}
+    if sales_data:
+        inputs["sales_data"] = sales_data
+    if contact_html:
+        inputs["contact_html"] = contact_html
     payload = {
-        "inputs": {"company_url": company_url, "contact_url": contact_url},
+        "inputs": inputs,
         "response_mode": "streaming",
         "user": "form-filler-codegen",
     }
@@ -90,6 +106,9 @@ def fetch_code_from_dify(company_url: str, contact_url: str) -> str:
         log("playwright_code が空です", "ERROR")
         sys.exit(1)
 
+    if playwright_code.startswith("ERROR:"):
+        log(playwright_code, "WARN")
+
     return playwright_code
 
 
@@ -98,6 +117,28 @@ def sanitize_code(code: str) -> str:
     # ```python ... ``` を除去
     code = re.sub(r"^```(?:python)?\s*\n?", "", code.strip())
     code = re.sub(r"\n?```\s*$", "", code)
+
+    # checkbox の CSS非表示対策: scroll+check パターンを JavaScript 評価に変換
+    code = re.sub(
+        r'await (\w+)\.scroll_into_view_if_needed\(\)\n(\s+)await \1\.check\([^)]*\)',
+        r'await \1.evaluate("el => { el.checked = true; el.dispatchEvent(new Event(\'change\', { bubbles: true })); }")',
+        code,
+    )
+
+    # 末尾の確認ボタンクリックを除去（専用関数 find_and_click_confirm で処理）
+    # パターン1: コメント「確認」+ click()
+    code = re.sub(
+        r'\n\s*#[^\n]*確認[^\n]*\n\s*await\s+[^\n]*\.click\(\)\s*$',
+        '',
+        code.rstrip(),
+    )
+    # パターン2: 確認/confirmを含むセレクタのclick()
+    code = re.sub(
+        r'\n\s*await\s+[^\n]*(?:確認|confirm)[^\n]*\.click\(\)\s*$',
+        '',
+        code.rstrip(),
+        flags=re.IGNORECASE,
+    )
 
     dangerous_patterns = [
         (r"\bos\.(system|popen|exec)", "os.system/exec"),
@@ -196,6 +237,92 @@ async def find_and_click_submit(page) -> str:
     return ""
 
 
+async def find_and_click_confirm(page, timeout: int = 5000) -> str:
+    """確認ボタンを検出してクリックする。クリックしたボタンのテキストを返す。
+
+    フォーム入力後に表示される「確認」「確認する」「確認画面へ」等の
+    ボタンを堅牢に検出する。disabled状態のボタンは有効化を待機する。
+    """
+    confirm_texts = [
+        "確認画面へ", "確認画面に進む", "入力内容を確認する", "入力内容を確認",
+        "確認する", "確認", "次へ進む", "次へ",
+        "Confirm",
+    ]
+
+    # ボタンロールで検索
+    for text in confirm_texts:
+        btn = page.get_by_role("button", name=text)
+        if await btn.count() > 0:
+            target = btn.first
+            try:
+                await target.scroll_into_view_if_needed()
+                # disabled の場合は有効化を待機
+                if not await target.is_enabled():
+                    log(f"確認ボタン「{text}」が無効状態、有効化を待機中...")
+                    enabled = False
+                    for _ in range(timeout // 500):
+                        await asyncio.sleep(0.5)
+                        if await target.is_enabled():
+                            enabled = True
+                            break
+                    if not enabled:
+                        log(f"確認ボタン「{text}」が有効化されませんでした", "WARN")
+                        continue
+                await target.click()
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    pass
+                return text
+            except Exception as e:
+                log(f"確認ボタン「{text}」クリック失敗: {e}", "WARN")
+                continue
+
+    # input[type="submit"] で value に確認系テキストを含むもの
+    for keyword in ["確認", "Confirm"]:
+        btn = page.locator(f'input[type="submit"][value*="{keyword}"]')
+        if await btn.count() > 0:
+            target = btn.first
+            try:
+                value = await target.get_attribute("value") or keyword
+                await target.scroll_into_view_if_needed()
+                if not await target.is_enabled():
+                    log(f"確認input「{value}」が無効状態、有効化を待機中...")
+                    enabled = False
+                    for _ in range(timeout // 500):
+                        await asyncio.sleep(0.5)
+                        if await target.is_enabled():
+                            enabled = True
+                            break
+                    if not enabled:
+                        log(f"確認input「{value}」が有効化されませんでした", "WARN")
+                        continue
+                await target.click()
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    pass
+                return value
+            except Exception:
+                continue
+
+    # リンク（<a>タグ）で確認ボタンとして使われるもの
+    for text in ["確認画面へ", "確認する", "確認"]:
+        link = page.get_by_role("link", name=text)
+        if await link.count() > 0:
+            try:
+                await link.first.click()
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    pass
+                return text
+            except Exception:
+                continue
+
+    return ""
+
+
 async def execute_code(
     code: str,
     contact_url: str = "",
@@ -252,9 +379,27 @@ async def execute_code(
         page.set_default_timeout(timeout * 1000)
 
         try:
-            log("生成コードを実行中...")
-            await fill_form(page)
+            # Step 1: フォーム入力（生成コード実行）
+            fill_error = None
+            fill_traceback = None
+            try:
+                log("生成コードを実行中...")
+                await fill_form(page)
+            except Exception as e:
+                fill_error = e
+                fill_traceback = traceback.format_exc()
+                log(f"生成コード実行中にエラー: {e}", "WARN")
 
+            # Step 2: 確認ボタン検出・クリック
+            log("確認ボタンを検索中...")
+            confirm_text = await find_and_click_confirm(page)
+            if confirm_text:
+                log(f"確認ボタンクリック完了: 「{confirm_text}」", "OK")
+                fill_error = None  # 確認ボタンが押せた = フォーム入力は成功
+            else:
+                log("確認ボタンなし（直接送信型または確認済み）")
+
+            # Step 3: 結果判定
             if submit:
                 log("送信ボタンを検索中...")
                 btn_text = await find_and_click_submit(page)
@@ -266,19 +411,32 @@ async def execute_code(
                     result["status"] = "error"
                     result["message"] = "送信ボタンが見つかりませんでした"
                     log("送信ボタンが見つかりませんでした", "WARN")
+            elif fill_error:
+                result["status"] = "error"
+                result["message"] = str(fill_error)
+                result["errors"].append(fill_traceback)
+                log(f"実行エラー: {fill_error}", "ERROR")
             else:
+                msg = "実行完了（ドライラン）"
+                if confirm_text:
+                    msg += f" - 確認「{confirm_text}」クリック済み"
                 result["status"] = "ok"
-                result["message"] = "実行完了（ドライラン）"
-                log("実行完了（ドライラン）", "OK")
+                result["message"] = msg
+                log(msg, "OK")
 
             if screenshot:
                 screenshot_dir = Path("screenshots")
                 screenshot_dir.mkdir(exist_ok=True)
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                path = screenshot_dir / f"codegen_{ts}.png"
-                await page.screenshot(path=str(path), full_page=True)
-                result["screenshots"].append(str(path))
-                log(f"スクリーンショット保存: {path}", "OK")
+                is_error = result["status"] == "error"
+                prefix = "codegen_error" if is_error else "codegen"
+                path = screenshot_dir / f"{prefix}_{ts}.png"
+                try:
+                    await page.screenshot(path=str(path), full_page=True)
+                    result["screenshots"].append(str(path))
+                    log(f"スクリーンショット保存: {path}", "OK")
+                except Exception:
+                    pass
 
             if headed:
                 log("ブラウザを閉じるにはEnterキーを押してください...")
@@ -350,6 +508,14 @@ def parse_args():
         "--submit", action="store_true", default=False,
         help="フォーム入力後に送信ボタンをクリックする（デフォルト: ドライラン）",
     )
+    parser.add_argument(
+        "--config", default="",
+        help="営業担当者データJSONファイルのパス（デフォルト: config_example.json）",
+    )
+    parser.add_argument(
+        "--no-render", action="store_true", default=False,
+        help="PlaywrightによるHTML事前レンダリングをスキップする（従来動作）",
+    )
     return parser.parse_args()
 
 
@@ -376,7 +542,42 @@ def main():
         print()
 
         print("--- Step 1: Dify コード生成 ---\n")
-        code = fetch_code_from_dify(args.company_url, args.contact_url)
+        sales_data = load_sales_data(args.config)
+        log(f"営業担当者データ読み込み完了: {args.config or 'config_example.json'}", "OK")
+
+        # HTML事前レンダリング（--no-render でスキップ可能）
+        contact_html = ""
+        if not args.no_render:
+            log("PlaywrightでフォームHTML取得中...")
+            contact_html = asyncio.run(fetch_rendered_html(
+                url=args.contact_url,
+                extract_form=True,
+            ))
+            if contact_html:
+                log(f"フォームHTML取得完了: {len(contact_html)} 文字", "OK")
+            else:
+                log("フォームHTML取得失敗（Dify側HTTPリクエストにフォールバック）", "WARN")
+
+        code = fetch_code_from_dify(args.company_url, args.contact_url, sales_data, contact_html)
+
+        # フォームが見つからなかった場合はスキップ
+        if code.startswith("ERROR:"):
+            result = {
+                "status": "skip",
+                "message": code,
+                "screenshots": [],
+                "errors": [],
+            }
+            slack_notify(
+                company_name=args.company_url or "",
+                contact_url=args.contact_url or "",
+                status=result["status"],
+                message=result["message"],
+            )
+            print(f"\n--- 実行結果 ---")
+            print(f"  ステータス: {result['status']}")
+            print(f"  メッセージ: {result['message']}")
+            sys.exit(1)
 
         # コード保存オプション
         if args.save_code:
