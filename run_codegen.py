@@ -118,6 +118,13 @@ def sanitize_code(code: str) -> str:
     code = re.sub(r"^```(?:python)?\s*\n?", "", code.strip())
     code = re.sub(r"\n?```\s*$", "", code)
 
+    # checkbox の CSS非表示対策: scroll+check パターンを JavaScript 評価に変換
+    code = re.sub(
+        r'await (\w+)\.scroll_into_view_if_needed\(\)\n(\s+)await \1\.check\([^)]*\)',
+        r'await \1.evaluate("el => { el.checked = true; el.dispatchEvent(new Event(\'change\', { bubbles: true })); }")',
+        code,
+    )
+
     # 末尾の確認ボタンクリックを除去（専用関数 find_and_click_confirm で処理）
     # パターン1: コメント「確認」+ click()
     code = re.sub(
