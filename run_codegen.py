@@ -51,7 +51,16 @@ def load_sales_data(config_path: str = "") -> str:
         return f.read()
 
 
-def fetch_code_from_dify(company_url: str, contact_url: str, sales_data: str = "", contact_html: str = "") -> str:
+def fetch_code_from_dify(
+    company_url: str,
+    contact_url: str,
+    sales_data: str = "",
+    contact_html: str = "",
+    company_name: str = "",
+    company_overview: str = "",
+    business_summary: str = "",
+    riskdog_industry: str = "",
+) -> str:
     """Dify ワークフローAPIを呼び出してPlaywrightコードを取得する"""
     endpoint = f"{DIFY_BASE_URL}/workflows/run"
     headers = {
@@ -63,6 +72,14 @@ def fetch_code_from_dify(company_url: str, contact_url: str, sales_data: str = "
         inputs["sales_data"] = sales_data
     if contact_html:
         inputs["contact_html"] = contact_html
+    if company_name:
+        inputs["company_name"] = company_name
+    if company_overview:
+        inputs["company_overview"] = company_overview
+    if business_summary:
+        inputs["business_summary"] = business_summary
+    if riskdog_industry:
+        inputs["riskdog_industry"] = riskdog_industry
     payload = {
         "inputs": inputs,
         "response_mode": "streaming",
@@ -70,7 +87,7 @@ def fetch_code_from_dify(company_url: str, contact_url: str, sales_data: str = "
     }
 
     log("Dify API 呼び出し中（ストリーミング）...")
-    resp = requests.post(endpoint, headers=headers, json=payload, timeout=600, stream=True)
+    resp = requests.post(endpoint, headers=headers, json=payload, timeout=(10, 600), stream=True)
     if resp.status_code != 200:
         log(f"ステータスコード: {resp.status_code}", "ERROR")
         log(f"レスポンス: {resp.text}", "ERROR")
@@ -488,6 +505,22 @@ def parse_args():
         help="お問い合わせフォームのURL（Dify APIモード時）",
     )
     parser.add_argument(
+        "--company-name", default="",
+        help="会社名",
+    )
+    parser.add_argument(
+        "--company-overview", default="",
+        help="企業概要",
+    )
+    parser.add_argument(
+        "--business-summary", default="",
+        help="事業内容一言説明",
+    )
+    parser.add_argument(
+        "--riskdog-industry", default="",
+        help="Riskdog業界",
+    )
+    parser.add_argument(
         "--file",
         help="ローカルのPythonコードファイルを直接実行（デバッグ用）",
     )
@@ -565,7 +598,16 @@ def main():
             else:
                 log("フォームHTML取得失敗（Dify側HTTPリクエストにフォールバック）", "WARN")
 
-        code = fetch_code_from_dify(args.company_url, args.contact_url, sales_data, contact_html)
+        code = fetch_code_from_dify(
+            company_url=args.company_url,
+            contact_url=args.contact_url,
+            sales_data=sales_data,
+            contact_html=contact_html,
+            company_name=args.company_name,
+            company_overview=args.company_overview,
+            business_summary=args.business_summary,
+            riskdog_industry=args.riskdog_industry,
+        )
 
         # フォームが見つからなかった場合はスキップ
         if code.startswith("ERROR:"):
@@ -576,7 +618,7 @@ def main():
                 "errors": [],
             }
             slack_notify(
-                company_name=args.company_url or "",
+                company_name=args.company_name or "",
                 contact_url=args.contact_url or "",
                 status=result["status"],
                 message=result["message"],
@@ -610,7 +652,7 @@ def main():
 
     # Slack通知（非同期・エラーでもフローを止めない）
     slack_notify(
-        company_name=args.company_url or "",
+        company_name=args.company_name or args.company_url or "",
         contact_url=args.contact_url or "",
         status=result["status"],
         message=result["message"],
