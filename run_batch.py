@@ -27,10 +27,16 @@ COLUMN_MAP = {
     "企業名": "company_name",
     "会社サイトURL": "company_url",
     "お問い合わせURL": "contact_url",
+    "企業概要": "company_overview",
+    "事業内容一言説明": "business_summary",
+    "Riskdog業界": "riskdog_industry",
     # 英語列名はそのまま
     "company_name": "company_name",
     "company_url": "company_url",
     "contact_url": "contact_url",
+    "company_overview": "company_overview",
+    "business_summary": "business_summary",
+    "riskdog_industry": "riskdog_industry",
 }
 
 
@@ -175,6 +181,9 @@ async def process_batch(args, rows, sales_data):
             company_name = row.get("company_name", "")
             company_url = row["company_url"]
             contact_url = row["contact_url"]
+            company_overview = row.get("company_overview", "")
+            business_summary = row.get("business_summary", "")
+            riskdog_industry = row.get("riskdog_industry", "")
 
             label = company_name or company_url
             print(f"\n--- [{i}/{total}] {label} ---\n")
@@ -205,7 +214,16 @@ async def process_batch(args, rows, sales_data):
                         log("フォームHTML取得失敗（Dify側HTTPリクエストにフォールバック）", "WARN")
 
                 # Step 1: Dify APIからコード取得
-                code = fetch_code_from_dify(company_url, contact_url, sales_data, contact_html)
+                code = fetch_code_from_dify(
+                    company_url=company_url,
+                    contact_url=contact_url,
+                    sales_data=sales_data,
+                    contact_html=contact_html,
+                    company_name=company_name,
+                    company_overview=company_overview,
+                    business_summary=business_summary,
+                    riskdog_industry=riskdog_industry,
+                )
 
                 # フォームが見つからなかった場合はスキップ
                 if code.startswith("ERROR:"):

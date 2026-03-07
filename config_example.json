@@ -42,5 +42,6 @@
   "preferred_contact": "メール",
   "preferred_time": "10:00〜12:00",
   "desired_start": "3ヶ月以内",
-  "privacy_agree": "true"
+  "privacy_agree": "true",
+  "spir_link": "https://spir.ai/example"
 }
