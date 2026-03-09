@@ -21,7 +21,7 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-import requests
+import aiohttp
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
@@ -32,6 +32,11 @@ load_dotenv()
 
 DIFY_API_KEY = os.environ.get("DIFY_API_KEY", "")
 DIFY_BASE_URL = os.environ.get("DIFY_BASE_URL", "https://api.dify.ai/v1")
+
+
+class DifyApiError(Exception):
+    """Dify API呼び出し時のエラー"""
+    pass
 
 
 def log(msg: str, level: str = "INFO"):
@@ -51,7 +56,7 @@ def load_sales_data(config_path: str = "") -> str:
         return f.read()
 
 
-def fetch_code_from_dify(
+async def fetch_code_from_dify(
     company_url: str,
     contact_url: str,
     sales_data: str = "",
@@ -60,8 +65,11 @@ def fetch_code_from_dify(
     company_overview: str = "",
     business_summary: str = "",
     riskdog_industry: str = "",
+    label: str = "",
+    session: aiohttp.ClientSession | None = None,
 ) -> str:
     """Dify ワークフローAPIを呼び出してPlaywrightコードを取得する"""
+    prefix = f"[{label}] " if label else ""
     endpoint = f"{DIFY_BASE_URL}/workflows/run"
     headers = {
         "Authorization": f"Bearer {DIFY_API_KEY}",
@@ -86,45 +94,68 @@ def fetch_code_from_dify(
         "user": "form-filler-codegen",
     }
 
-    log("Dify API 呼び出し中（ストリーミング）...")
-    resp = requests.post(endpoint, headers=headers, json=payload, timeout=(10, 600), stream=True)
-    if resp.status_code != 200:
-        log(f"ステータスコード: {resp.status_code}", "ERROR")
-        log(f"レスポンス: {resp.text}", "ERROR")
-        sys.exit(1)
+    log(f"{prefix}Dify API 呼び出し中（ストリーミング）...")
 
-    outputs = None
-    for line in resp.iter_lines(decode_unicode=True):
-        if not line or not line.startswith("data: "):
-            continue
-        data = json.loads(line[6:])
-        event = data.get("event", "")
+    own_session = session is None
+    if own_session:
+        session = aiohttp.ClientSession()
 
-        if event == "workflow_started":
-            log("ワークフロー開始...")
-        elif event == "node_started":
-            node_title = data.get("data", {}).get("title", "")
-            if node_title:
-                log(f"処理中: {node_title}")
-        elif event == "workflow_finished":
-            outputs = data.get("data", {}).get("outputs", {})
-            log("ワークフロー完了", "OK")
-        elif event == "error":
-            msg = data.get("message", "不明なエラー")
-            log(f"{msg}", "ERROR")
-            sys.exit(1)
+    try:
+        async with session.post(
+            endpoint,
+            headers=headers,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(sock_connect=10, total=600),
+        ) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                log(f"{prefix}ステータスコード: {resp.status}", "ERROR")
+                log(f"{prefix}レスポンス: {body}", "ERROR")
+                raise DifyApiError(f"HTTP {resp.status}: {body[:200]}")
+
+            outputs = None
+            while True:
+                raw_line = await resp.content.readline()
+                if not raw_line:
+                    break
+                line = raw_line.decode("utf-8").strip()
+                if not line or not line.startswith("data: "):
+                    continue
+                try:
+                    data = json.loads(line[6:])
+                except json.JSONDecodeError:
+                    log(f"{prefix}SSE JSONパース失敗: {line[:200]}", "WARN")
+                    continue
+                event = data.get("event", "")
+
+                if event == "workflow_started":
+                    log(f"{prefix}ワークフロー開始...")
+                elif event == "node_started":
+                    node_title = data.get("data", {}).get("title", "")
+                    if node_title:
+                        log(f"{prefix}処理中: {node_title}")
+                elif event == "workflow_finished":
+                    outputs = data.get("data", {}).get("outputs", {})
+                    log(f"{prefix}ワークフロー完了", "OK")
+                elif event == "error":
+                    msg = data.get("message", "不明なエラー")
+                    log(f"{prefix}{msg}", "ERROR")
+                    raise DifyApiError(msg)
+    finally:
+        if own_session:
+            await session.close()
 
     if not outputs:
-        log("ワークフロー出力を取得できませんでした", "ERROR")
-        sys.exit(1)
+        log(f"{prefix}ワークフロー出力を取得できませんでした", "ERROR")
+        raise DifyApiError("ワークフロー出力なし")
 
     playwright_code = outputs.get("playwright_code", "")
     if not playwright_code:
-        log("playwright_code が空です", "ERROR")
-        sys.exit(1)
+        log(f"{prefix}playwright_code が空です", "ERROR")
+        raise DifyApiError("playwright_code が空")
 
     if playwright_code.startswith("ERROR:"):
-        log(playwright_code, "WARN")
+        log(f"{prefix}{playwright_code}", "WARN")
 
     return playwright_code
 
@@ -355,8 +386,16 @@ async def execute_code(
     timeout: int = 30,
     slow_mo: int = 100,
     submit: bool = False,
+    browser=None,
+    label: str = "",
 ) -> dict:
-    """生成されたPlaywrightコードを実行する"""
+    """生成されたPlaywrightコードを実行する
+
+    Args:
+        browser: 既存のブラウザインスタンス（バッチ処理での再利用用）。
+                 Noneの場合は内部で起動・終了する。
+    """
+    prefix = f"[{label}] " if label else ""
     result = {
         "status": "unknown",
         "message": "",
@@ -368,7 +407,7 @@ async def execute_code(
     code = inject_url(code, contact_url)
     code = prepare_function(code)
 
-    log(f"生成コード: {len(code)} 文字")
+    log(f"{prefix}生成コード: {len(code)} 文字")
 
     # fill_form 関数をコンパイル
     namespace = {}
@@ -377,117 +416,125 @@ async def execute_code(
     except SyntaxError as e:
         result["status"] = "error"
         result["message"] = f"構文エラー: {e}"
-        log(f"構文エラー: {e}", "ERROR")
+        log(f"{prefix}構文エラー: {e}", "ERROR")
         return result
 
     fill_form = namespace.get("fill_form")
     if fill_form is None:
         result["status"] = "error"
         result["message"] = "fill_form 関数が見つかりません"
-        log("fill_form 関数が見つかりません", "ERROR")
+        log(f"{prefix}fill_form 関数が見つかりません", "ERROR")
         return result
 
-    log("fill_form 関数を検出", "OK")
+    log(f"{prefix}fill_form 関数を検出", "OK")
 
     # ブラウザ起動・実行
-    async with async_playwright() as p:
+    own_browser = browser is None
+    p = None
+    if own_browser:
+        p = await async_playwright().start()
         browser = await p.chromium.launch(
             headless=not headed,
             slow_mo=slow_mo,
         )
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            locale="ja-JP",
-        )
-        page = await context.new_page()
-        page.set_default_timeout(timeout * 1000)
 
+    context = await browser.new_context(
+        viewport={"width": 1280, "height": 900},
+        locale="ja-JP",
+    )
+    page = await context.new_page()
+    page.set_default_timeout(timeout * 1000)
+
+    try:
+        # Step 1: フォーム入力（生成コード実行）
+        fill_error = None
+        fill_traceback = None
         try:
-            # Step 1: フォーム入力（生成コード実行）
-            fill_error = None
-            fill_traceback = None
-            try:
-                log("生成コードを実行中...")
-                await fill_form(page)
-            except Exception as e:
-                fill_error = e
-                fill_traceback = traceback.format_exc()
-                log(f"生成コード実行中にエラー: {e}", "WARN")
-
-            # Step 2: 確認ボタン検出・クリック
-            log("確認ボタンを検索中...")
-            confirm_text = await find_and_click_confirm(page)
-            if confirm_text:
-                log(f"確認ボタンクリック完了: 「{confirm_text}」", "OK")
-                fill_error = None  # 確認ボタンが押せた = フォーム入力は成功
-            else:
-                log("確認ボタンなし（直接送信型または確認済み）")
-
-            # Step 3: 結果判定
-            if submit:
-                log("送信ボタンを検索中...")
-                btn_text = await find_and_click_submit(page)
-                if btn_text:
-                    result["status"] = "ok"
-                    result["message"] = f"送信完了（{btn_text}）"
-                    log(f"送信完了: {btn_text}", "OK")
-                else:
-                    result["status"] = "error"
-                    result["message"] = "送信ボタンが見つかりませんでした"
-                    log("送信ボタンが見つかりませんでした", "WARN")
-            elif fill_error:
-                result["status"] = "error"
-                result["message"] = str(fill_error)
-                result["errors"].append(fill_traceback)
-                log(f"実行エラー: {fill_error}", "ERROR")
-            else:
-                msg = "実行完了（ドライラン）"
-                if confirm_text:
-                    msg += f" - 確認「{confirm_text}」クリック済み"
-                result["status"] = "ok"
-                result["message"] = msg
-                log(msg, "OK")
-
-            if screenshot:
-                screenshot_dir = Path("screenshots")
-                screenshot_dir.mkdir(exist_ok=True)
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                is_error = result["status"] == "error"
-                prefix = "codegen_error" if is_error else "codegen"
-                path = screenshot_dir / f"{prefix}_{ts}.png"
-                try:
-                    await page.screenshot(path=str(path), full_page=True)
-                    result["screenshots"].append(str(path))
-                    log(f"スクリーンショット保存: {path}", "OK")
-                except Exception:
-                    pass
-
-            if headed:
-                log("ブラウザを閉じるにはEnterキーを押してください...")
-                try:
-                    input()
-                except EOFError:
-                    pass
-
+            log(f"{prefix}生成コードを実行中...")
+            await fill_form(page)
         except Exception as e:
+            fill_error = e
+            fill_traceback = traceback.format_exc()
+            log(f"{prefix}生成コード実行中にエラー: {e}", "WARN")
+
+        # Step 2: 確認ボタン検出・クリック
+        log(f"{prefix}確認ボタンを検索中...")
+        confirm_text = await find_and_click_confirm(page)
+        if confirm_text:
+            log(f"{prefix}確認ボタンクリック完了: 「{confirm_text}」", "OK")
+            fill_error = None  # 確認ボタンが押せた = フォーム入力は成功
+        else:
+            log(f"{prefix}確認ボタンなし（直接送信型または確認済み）")
+
+        # Step 3: 結果判定
+        if submit:
+            log(f"{prefix}送信ボタンを検索中...")
+            btn_text = await find_and_click_submit(page)
+            if btn_text:
+                result["status"] = "ok"
+                result["message"] = f"送信完了（{btn_text}）"
+                log(f"{prefix}送信完了: {btn_text}", "OK")
+            else:
+                result["status"] = "error"
+                result["message"] = "送信ボタンが見つかりませんでした"
+                log(f"{prefix}送信ボタンが見つかりませんでした", "WARN")
+        elif fill_error:
             result["status"] = "error"
-            result["message"] = str(e)
-            result["errors"].append(traceback.format_exc())
-            log(f"実行エラー: {e}", "ERROR")
+            result["message"] = str(fill_error)
+            result["errors"].append(fill_traceback)
+            log(f"{prefix}実行エラー: {fill_error}", "ERROR")
+        else:
+            msg = "実行完了（ドライラン）"
+            if confirm_text:
+                msg += f" - 確認「{confirm_text}」クリック済み"
+            result["status"] = "ok"
+            result["message"] = msg
+            log(f"{prefix}{msg}", "OK")
 
-            if screenshot:
-                screenshot_dir = Path("screenshots")
-                screenshot_dir.mkdir(exist_ok=True)
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                path = screenshot_dir / f"codegen_error_{ts}.png"
-                try:
-                    await page.screenshot(path=str(path), full_page=True)
-                    result["screenshots"].append(str(path))
-                except Exception:
-                    pass
+        if screenshot:
+            screenshot_dir = Path("screenshots")
+            screenshot_dir.mkdir(exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            is_error = result["status"] == "error"
+            sc_prefix = "codegen_error" if is_error else "codegen"
+            path = screenshot_dir / f"{sc_prefix}_{ts}.png"
+            try:
+                await page.screenshot(path=str(path), full_page=True)
+                result["screenshots"].append(str(path))
+                log(f"{prefix}スクリーンショット保存: {path}", "OK")
+            except Exception:
+                pass
 
-        finally:
+        if headed:
+            log(f"{prefix}ブラウザを閉じるにはEnterキーを押してください...")
+            try:
+                input()
+            except EOFError:
+                pass
+
+    except Exception as e:
+        result["status"] = "error"
+        result["message"] = str(e)
+        result["errors"].append(traceback.format_exc())
+        log(f"{prefix}実行エラー: {e}", "ERROR")
+
+        if screenshot:
+            screenshot_dir = Path("screenshots")
+            screenshot_dir.mkdir(exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            path = screenshot_dir / f"codegen_error_{ts}.png"
+            try:
+                await page.screenshot(path=str(path), full_page=True)
+                result["screenshots"].append(str(path))
+            except Exception:
+                pass
+
+    finally:
+        await context.close()
+        if own_browser:
             await browser.close()
+            if p:
+                await p.stop()
 
     return result
 
@@ -559,7 +606,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
+async def async_main():
     args = parse_args()
 
     print("\n=== Playwright コード生成モード ===\n")
@@ -589,16 +636,16 @@ def main():
         contact_html = ""
         if not args.no_render:
             log("PlaywrightでフォームHTML取得中...")
-            contact_html = asyncio.run(fetch_rendered_html(
+            contact_html = await fetch_rendered_html(
                 url=args.contact_url,
                 extract_form=True,
-            ))
+            )
             if contact_html:
                 log(f"フォームHTML取得完了: {len(contact_html)} 文字", "OK")
             else:
                 log("フォームHTML取得失敗（Dify側HTTPリクエストにフォールバック）", "WARN")
 
-        code = fetch_code_from_dify(
+        code = await fetch_code_from_dify(
             company_url=args.company_url,
             contact_url=args.contact_url,
             sales_data=sales_data,
@@ -640,7 +687,7 @@ def main():
 
     print(f"\n--- {'Step 2: ' if not args.file else ''}コード実行 ---\n")
 
-    result = asyncio.run(execute_code(
+    result = await execute_code(
         code=code,
         contact_url=args.contact_url or "",
         headed=args.headed,
@@ -648,7 +695,7 @@ def main():
         timeout=args.timeout,
         slow_mo=args.slow_mo,
         submit=args.submit,
-    ))
+    )
 
     # Slack通知（非同期・エラーでもフローを止めない）
     slack_notify(
@@ -671,6 +718,10 @@ def main():
                 print(f"    {line}")
 
     sys.exit(0 if result["status"] == "ok" else 1)
+
+
+def main():
+    asyncio.run(async_main())
 
 
 if __name__ == "__main__":

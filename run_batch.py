@@ -1,25 +1,27 @@
 """
-バッチ実行モード: CSVから複数のお問い合わせフォームを一括処理
+バッチ実行モード: CSVから複数のお問い合わせフォームを一括処理（並列対応）
 
 入力CSVの各行に対してDify APIでPlaywrightコードを生成・実行し、
-結果をレポートCSVに出力する。
+結果をレポートCSVに出力する。--workers で同時実行数を制御できる。
 
 使い方:
   poetry run python run_batch.py data/targets.csv
-  poetry run python run_batch.py data/targets.csv --headed --screenshot --save-code
+  poetry run python run_batch.py data/targets.csv --workers 5 --screenshot
 """
 import argparse
 import asyncio
 import csv
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
 
+import aiohttp
 from playwright.async_api import async_playwright
 
 from fetch_html import fetch_rendered_html
-from run_codegen import execute_code, fetch_code_from_dify, load_sales_data, log
-from slack_notifier import notify as slack_notify
+from run_codegen import DifyApiError, execute_code, fetch_code_from_dify, load_sales_data, log
+from slack_notifier import async_notify as slack_notify
 
 
 # CSV列名のマッピング（日本語列名 → 内部名）
@@ -38,6 +40,13 @@ COLUMN_MAP = {
     "business_summary": "business_summary",
     "riskdog_industry": "riskdog_industry",
 }
+
+
+def safe_filename(value: str) -> str:
+    """ファイル名に使えない文字を除去する"""
+    value = re.sub(r'[\\/:*?"<>|]+', "_", value)
+    value = re.sub(r"\s+", "_", value).strip("_")
+    return value[:50] or "no_name"
 
 
 def read_csv(csv_path: str) -> list[dict]:
@@ -135,12 +144,8 @@ def parse_args():
         help="タイムアウト（秒）（デフォルト: 30）",
     )
     parser.add_argument(
-        "--slow-mo", type=int, default=100,
-        help="操作間の遅延（ミリ秒）（デフォルト: 100）",
-    )
-    parser.add_argument(
-        "--delay", type=int, default=5,
-        help="行間の待機（秒）（デフォルト: 5）",
+        "--slow-mo", type=int, default=0,
+        help="操作間の遅延（ミリ秒）（デフォルト: 0、デバッグ時に100等を指定）",
     )
     parser.add_argument(
         "--save-code", action="store_true", default=False,
@@ -158,15 +163,179 @@ def parse_args():
         "--no-render", action="store_true", default=False,
         help="PlaywrightによるHTML事前レンダリングをスキップする（従来動作）",
     )
+    parser.add_argument(
+        "--workers", type=int, default=5,
+        help="同時実行数（デフォルト: 5）",
+    )
     return parser.parse_args()
 
 
+async def process_single(
+    index: int,
+    total: int,
+    row: dict,
+    args,
+    sales_data: str,
+    semaphore: asyncio.Semaphore,
+    http_session: aiohttp.ClientSession,
+    exec_browser,
+    render_browser,
+) -> dict:
+    """1社分の処理を行うワーカー"""
+    async with semaphore:
+        company_name = row.get("company_name", "")
+        company_url = row["company_url"]
+        contact_url = row["contact_url"]
+        company_overview = row.get("company_overview", "")
+        business_summary = row.get("business_summary", "")
+        riskdog_industry = row.get("riskdog_industry", "")
+
+        label = company_name or company_url
+        log(f"[{index}/{total}] {label} 開始")
+
+        result_row = {
+            "company_name": company_name,
+            "company_url": company_url,
+            "contact_url": contact_url,
+            "status": "error",
+            "message": "",
+            "screenshot": "",
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+        try:
+            # Step 0: フォームHTML取得（レンダリング有効時）
+            contact_html = ""
+            if render_browser:
+                log(f"[{index}/{total}] PlaywrightでフォームHTML取得中...")
+                contact_html = await fetch_rendered_html(
+                    url=contact_url,
+                    extract_form=True,
+                    browser=render_browser,
+                )
+                if contact_html:
+                    log(f"[{index}/{total}] フォームHTML取得完了: {len(contact_html)} 文字", "OK")
+                else:
+                    log(f"[{index}/{total}] フォームHTML取得失敗（Dify側HTTPリクエストにフォールバック）", "WARN")
+
+            # Step 1: Dify APIからコード取得（リトライ付き）
+            # ※ここはコード生成の依頼のみ。フォーム送信はStep 2なので二重送信の心配なし
+            max_retries = 3
+            code = None
+            for attempt in range(1, max_retries + 1):
+                try:
+                    code = await fetch_code_from_dify(
+                        company_url=company_url,
+                        contact_url=contact_url,
+                        sales_data=sales_data,
+                        contact_html=contact_html,
+                        company_name=company_name,
+                        company_overview=company_overview,
+                        business_summary=business_summary,
+                        riskdog_industry=riskdog_industry,
+                        label=f"{index}/{total}",
+                        session=http_session,
+                    )
+                    break
+                except DifyApiError as e:
+                    if attempt < max_retries:
+                        wait = 2 ** attempt
+                        log(f"[{index}/{total}] リトライ {attempt}/{max_retries}: {e} → {wait}秒待機", "WARN")
+                        await asyncio.sleep(wait)
+                    else:
+                        raise
+
+            # 防御ガード: リトライロジック変更時の安全策
+            if code is None:
+                raise DifyApiError("コード取得に失敗しました")
+
+            # フォームが見つからなかった場合はスキップ
+            if code.startswith("ERROR:"):
+                result_row["status"] = "skip"
+                result_row["message"] = code
+                log(f"[{index}/{total}] スキップ: {code}", "WARN")
+                await slack_notify(
+                    company_name=company_name,
+                    contact_url=contact_url,
+                    status=result_row["status"],
+                    message=result_row["message"],
+                    session=http_session,
+                )
+                return result_row
+
+            # コード保存
+            if args.save_code:
+                save_dir = Path("generated_code")
+                save_dir.mkdir(exist_ok=True)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                safe_label = safe_filename(label)
+                save_path = save_dir / f"form_code_{safe_label}_{ts}.py"
+                with open(save_path, "w", encoding="utf-8") as f:
+                    f.write(code)
+                log(f"[{index}/{total}] 生成コード保存: {save_path}", "OK")
+
+            # Step 2: コード実行
+            exec_result = await execute_code(
+                code=code,
+                contact_url=contact_url,
+                headed=args.headed,
+                screenshot=args.screenshot,
+                timeout=args.timeout,
+                slow_mo=args.slow_mo,
+                submit=args.submit,
+                browser=exec_browser,
+                label=f"{index}/{total}",
+            )
+
+            result_row["status"] = exec_result["status"]
+            result_row["message"] = exec_result["message"]
+            if exec_result["screenshots"]:
+                result_row["screenshot"] = exec_result["screenshots"][0]
+
+        except DifyApiError as e:
+            result_row["status"] = "error"
+            result_row["message"] = str(e)
+            log(f"[{index}/{total}] Dify APIエラー: {e}", "WARN")
+
+        except Exception as e:
+            result_row["status"] = "error"
+            result_row["message"] = str(e)
+            log(f"[{index}/{total}] 予期しないエラー: {e}", "ERROR")
+
+        # Slack通知（1件ごと）
+        await slack_notify(
+            company_name=company_name,
+            contact_url=contact_url,
+            status=result_row["status"],
+            message=result_row["message"],
+            session=http_session,
+        )
+
+        status_sym = "OK" if result_row["status"] == "ok" else "WARN"
+        log(f"[{index}/{total}] {label} 完了 → {result_row['status']}", status_sym)
+
+        return result_row
+
+
 async def process_batch(args, rows, sales_data):
-    """バッチ処理のメインループ（ブラウザインスタンスを再利用）"""
+    """バッチ処理のメインループ（並列ワーカー）"""
     total = len(rows)
-    results = []
-    success_count = 0
-    error_count = 0
+    workers = args.workers
+
+    log(f"並列実行モード: {workers} ワーカー × {total} 件")
+
+    semaphore = asyncio.Semaphore(workers)
+
+    # 共有リソースの初期化
+    http_session = aiohttp.ClientSession()
+
+    # コード実行用ブラウザ
+    exec_pw = await async_playwright().start()
+    exec_browser = await exec_pw.chromium.launch(
+        headless=not args.headed,
+        slow_mo=args.slow_mo,
+    )
+    log("コード実行用ブラウザ起動", "OK")
 
     # HTML事前レンダリング用ブラウザ（--no-render でなければ起動）
     render_pw = None
@@ -177,138 +346,56 @@ async def process_batch(args, rows, sales_data):
         log("HTML取得用ブラウザ起動", "OK")
 
     try:
-        for i, row in enumerate(rows, 1):
-            company_name = row.get("company_name", "")
-            company_url = row["company_url"]
-            contact_url = row["contact_url"]
-            company_overview = row.get("company_overview", "")
-            business_summary = row.get("business_summary", "")
-            riskdog_industry = row.get("riskdog_industry", "")
-
-            label = company_name or company_url
-            print(f"\n--- [{i}/{total}] {label} ---\n")
-
-            result_row = {
-                "company_name": company_name,
-                "company_url": company_url,
-                "contact_url": contact_url,
-                "status": "error",
-                "message": "",
-                "screenshot": "",
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-
-            try:
-                # Step 0: フォームHTML取得（レンダリング有効時）
-                contact_html = ""
-                if render_browser:
-                    log("PlaywrightでフォームHTML取得中...")
-                    contact_html = await fetch_rendered_html(
-                        url=contact_url,
-                        extract_form=True,
-                        browser=render_browser,
-                    )
-                    if contact_html:
-                        log(f"フォームHTML取得完了: {len(contact_html)} 文字", "OK")
-                    else:
-                        log("フォームHTML取得失敗（Dify側HTTPリクエストにフォールバック）", "WARN")
-
-                # Step 1: Dify APIからコード取得
-                code = fetch_code_from_dify(
-                    company_url=company_url,
-                    contact_url=contact_url,
-                    sales_data=sales_data,
-                    contact_html=contact_html,
-                    company_name=company_name,
-                    company_overview=company_overview,
-                    business_summary=business_summary,
-                    riskdog_industry=riskdog_industry,
-                )
-
-                # フォームが見つからなかった場合はスキップ
-                if code.startswith("ERROR:"):
-                    result_row["status"] = "skip"
-                    result_row["message"] = code
-                    error_count += 1
-                    log(f"スキップ: {code}", "WARN")
-                    results.append(result_row)
-                    slack_notify(
-                        company_name=company_name,
-                        contact_url=contact_url,
-                        status=result_row["status"],
-                        message=result_row["message"],
-                    )
-                    if i < total:
-                        log(f"{args.delay}秒待機中...")
-                        await asyncio.sleep(args.delay)
-                    continue
-
-                # コード保存
-                if args.save_code:
-                    save_dir = Path("generated_code")
-                    save_dir.mkdir(exist_ok=True)
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    save_path = save_dir / f"form_code_{ts}.py"
-                    with open(save_path, "w", encoding="utf-8") as f:
-                        f.write(code)
-                    log(f"生成コード保存: {save_path}", "OK")
-
-                # Step 2: コード実行
-                exec_result = await execute_code(
-                    code=code,
-                    contact_url=contact_url,
-                    headed=args.headed,
-                    screenshot=args.screenshot,
-                    timeout=args.timeout,
-                    slow_mo=args.slow_mo,
-                    submit=args.submit,
-                )
-
-                result_row["status"] = exec_result["status"]
-                result_row["message"] = exec_result["message"]
-                if exec_result["screenshots"]:
-                    result_row["screenshot"] = exec_result["screenshots"][0]
-
-                if exec_result["status"] == "ok":
-                    success_count += 1
-                else:
-                    error_count += 1
-
-            except SystemExit:
-                result_row["status"] = "error"
-                result_row["message"] = "Dify API エラー"
-                error_count += 1
-                log("Dify APIエラーが発生しましたが、次の行に進みます", "WARN")
-
-            except Exception as e:
-                result_row["status"] = "error"
-                result_row["message"] = str(e)
-                error_count += 1
-                log(f"予期しないエラー: {e}", "ERROR")
-
-            results.append(result_row)
-
-            # Slack通知（1件ごと）
-            slack_notify(
-                company_name=company_name,
-                contact_url=contact_url,
-                status=result_row["status"],
-                message=result_row["message"],
+        # 全タスクを並列実行（Semaphore で同時実行数を制御）
+        tasks = [
+            process_single(
+                index=i,
+                total=total,
+                row=row,
+                args=args,
+                sales_data=sales_data,
+                semaphore=semaphore,
+                http_session=http_session,
+                exec_browser=exec_browser,
+                render_browser=render_browser,
             )
+            for i, row in enumerate(rows, 1)
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            # 行間の待機（最後の行以外）
-            if i < total:
-                log(f"{args.delay}秒待機中...")
-                await asyncio.sleep(args.delay)
+        # 例外を結果に変換
+        processed_results = []
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                row = rows[i]
+                log(f"[{i+1}/{total}] 致命的エラー: {r}", "ERROR")
+                processed_results.append({
+                    "company_name": row.get("company_name", ""),
+                    "company_url": row.get("company_url", ""),
+                    "contact_url": row.get("contact_url", ""),
+                    "status": "error",
+                    "message": str(r),
+                    "screenshot": "",
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                })
+            else:
+                processed_results.append(r)
+
+        success_count = sum(1 for r in processed_results if r["status"] == "ok")
+        error_count = total - success_count
 
     finally:
+        await http_session.close()
+        await exec_browser.close()
+        await exec_pw.stop()
+        log("コード実行用ブラウザ終了", "OK")
         if render_browser:
             await render_browser.close()
         if render_pw:
             await render_pw.stop()
             log("HTML取得用ブラウザ終了", "OK")
 
-    return results, success_count, error_count, total
+    return processed_results, success_count, error_count, total
 
 
 def main():
@@ -341,12 +428,12 @@ def main():
     print(f"{'=' * 40}\n")
 
     # Slack通知（バッチサマリー）
-    slack_notify(
+    asyncio.run(slack_notify(
         company_name="【バッチサマリー】",
         contact_url=report_file,
         status="ok" if error_count == 0 else "error",
         message=summary,
-    )
+    ))
 
     sys.exit(0 if error_count == 0 else 1)
 

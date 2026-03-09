@@ -7,6 +7,7 @@ Slack Webhook 通知モジュール
 import os
 from datetime import datetime
 
+import aiohttp
 import requests
 from dotenv import load_dotenv
 
@@ -15,16 +16,13 @@ load_dotenv()
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 
 
-def notify(
+def _build_payload(
     company_name: str,
     contact_url: str,
     status: str,
     message: str = "",
-) -> None:
-    """フォーム送信結果をSlackに通知する。
-
-    try/exceptで囲んでいるため、通知エラーが起きてもメインフローは止まらない。
-    """
+) -> dict:
+    """Slack通知用のペイロードを組み立てる。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     is_ok = status == "ok"
     emoji = ":white_check_mark:" if is_ok else ":x:"
@@ -38,7 +36,20 @@ def notify(
         text += f"• メッセージ: {message}\n"
     text += f"• 時刻: {now}"
 
-    payload = {"text": text}
+    return {"text": text}
+
+
+def notify(
+    company_name: str,
+    contact_url: str,
+    status: str,
+    message: str = "",
+) -> None:
+    """フォーム送信結果をSlackに通知する（同期版）。
+
+    try/exceptで囲んでいるため、通知エラーが起きてもメインフローは止まらない。
+    """
+    payload = _build_payload(company_name, contact_url, status, message)
 
     try:
         resp = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=10)
@@ -46,3 +57,36 @@ def notify(
             print(f"  [!] Slack通知失敗 (HTTP {resp.status_code}): {resp.text}")
     except Exception as e:
         print(f"  [!] Slack通知エラー: {e}")
+
+
+async def async_notify(
+    company_name: str,
+    contact_url: str,
+    status: str,
+    message: str = "",
+    session: aiohttp.ClientSession | None = None,
+) -> None:
+    """フォーム送信結果をSlackに通知する（非同期版）。
+
+    try/exceptで囲んでいるため、通知エラーが起きてもメインフローは止まらない。
+    """
+    payload = _build_payload(company_name, contact_url, status, message)
+
+    own_session = session is None
+    if own_session:
+        session = aiohttp.ClientSession()
+
+    try:
+        async with session.post(
+            SLACK_WEBHOOK_URL,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                print(f"  [!] Slack通知失敗 (HTTP {resp.status}): {body}")
+    except Exception as e:
+        print(f"  [!] Slack通知エラー: {e}")
+    finally:
+        if own_session:
+            await session.close()
