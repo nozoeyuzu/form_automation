@@ -5,8 +5,14 @@
 結果をレポートCSVに出力する。--workers で同時実行数を制御できる。
 
 使い方:
-  poetry run python run_batch.py data/targets.csv
-  poetry run python run_batch.py data/targets.csv --workers 5 --screenshot
+  # ドライラン（入力だけ、送信しない）
+  poetry run python run_batch.py data/targets.csv --screenshot --save-code
+
+  # 本番（実際に送信する）
+  poetry run python run_batch.py data/targets.csv --submit --screenshot --save-code
+
+  # 並列数を変更する場合
+  poetry run python run_batch.py data/targets.csv --submit --workers 5
 """
 import argparse
 import asyncio
@@ -164,8 +170,8 @@ def parse_args():
         help="PlaywrightによるHTML事前レンダリングをスキップする（従来動作）",
     )
     parser.add_argument(
-        "--workers", type=int, default=5,
-        help="同時実行数（デフォルト: 5）",
+        "--workers", type=int, default=10,
+        help="同時実行数（デフォルト: 10）",
     )
     return parser.parse_args()
 
