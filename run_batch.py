@@ -26,7 +26,7 @@ import aiohttp
 from playwright.async_api import async_playwright
 
 from fetch_html import fetch_rendered_html
-from run_codegen import DifyApiError, execute_code, fetch_code_from_dify, load_sales_data, log
+from run_codegen import DifyApiError, NO_FIT_ERROR, execute_code, fetch_code_from_dify, load_sales_data, log
 from slack_notifier import async_notify as slack_notify
 
 
@@ -227,10 +227,10 @@ async def process_single(
             # Step 1: Dify APIからコード取得（リトライ付き）
             # ※ここはコード生成の依頼のみ。フォーム送信はStep 2なので二重送信の心配なし
             max_retries = 3
-            code = None
+            dify_result = None
             for attempt in range(1, max_retries + 1):
                 try:
-                    code = await fetch_code_from_dify(
+                    dify_result = await fetch_code_from_dify(
                         company_url=company_url,
                         contact_url=contact_url,
                         sales_data=sales_data,
@@ -252,8 +252,10 @@ async def process_single(
                         raise
 
             # 防御ガード: リトライロジック変更時の安全策
-            if code is None:
+            if dify_result is None:
                 raise DifyApiError("コード取得に失敗しました")
+            code = dify_result["playwright_code"]
+            no_fit_reason = dify_result.get("no_fit_reason", "")
 
             # フォームが見つからなかった場合はスキップ
             if code.startswith("ERROR:"):
@@ -265,6 +267,7 @@ async def process_single(
                     contact_url=contact_url,
                     status=result_row["status"],
                     message=result_row["message"],
+                    no_fit_reason=no_fit_reason if code == NO_FIT_ERROR else "",
                     session=http_session,
                 )
                 return result_row
