@@ -32,6 +32,7 @@ load_dotenv()
 
 DIFY_API_KEY = os.environ.get("DIFY_API_KEY", "")
 DIFY_BASE_URL = os.environ.get("DIFY_BASE_URL", "https://api.dify.ai/v1")
+NO_FIT_ERROR = "ERROR: Riskdogに関連する訴求ポイントが見つかりませんでした（該当業界または業務関連性なし）"
 
 
 class DifyApiError(Exception):
@@ -67,7 +68,7 @@ async def fetch_code_from_dify(
     riskdog_industry: str = "",
     label: str = "",
     session: aiohttp.ClientSession | None = None,
-) -> str:
+) -> dict[str, str]:
     """Dify ワークフローAPIを呼び出してPlaywrightコードを取得する"""
     prefix = f"[{label}] " if label else ""
     endpoint = f"{DIFY_BASE_URL}/workflows/run"
@@ -150,6 +151,7 @@ async def fetch_code_from_dify(
         raise DifyApiError("ワークフロー出力なし")
 
     playwright_code = outputs.get("playwright_code", "")
+    no_fit_reason = outputs.get("no_fit_reason", "")
     if not playwright_code:
         log(f"{prefix}playwright_code が空です", "ERROR")
         raise DifyApiError("playwright_code が空")
@@ -157,7 +159,10 @@ async def fetch_code_from_dify(
     if playwright_code.startswith("ERROR:"):
         log(f"{prefix}{playwright_code}", "WARN")
 
-    return playwright_code
+    return {
+        "playwright_code": playwright_code,
+        "no_fit_reason": no_fit_reason,
+    }
 
 
 def sanitize_code(code: str) -> str:
@@ -645,7 +650,7 @@ async def async_main():
             else:
                 log("フォームHTML取得失敗（Dify側HTTPリクエストにフォールバック）", "WARN")
 
-        code = await fetch_code_from_dify(
+        dify_result = await fetch_code_from_dify(
             company_url=args.company_url,
             contact_url=args.contact_url,
             sales_data=sales_data,
@@ -655,6 +660,8 @@ async def async_main():
             business_summary=args.business_summary,
             riskdog_industry=args.riskdog_industry,
         )
+        code = dify_result["playwright_code"]
+        no_fit_reason = dify_result.get("no_fit_reason", "")
 
         # フォームが見つからなかった場合はスキップ
         if code.startswith("ERROR:"):
@@ -669,6 +676,7 @@ async def async_main():
                 contact_url=args.contact_url or "",
                 status=result["status"],
                 message=result["message"],
+                no_fit_reason=no_fit_reason if code == NO_FIT_ERROR else "",
             )
             print(f"\n--- 実行結果 ---")
             print(f"  ステータス: {result['status']}")
