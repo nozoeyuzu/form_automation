@@ -26,7 +26,7 @@ import aiohttp
 from playwright.async_api import async_playwright
 
 from fetch_html import fetch_rendered_html
-from run_codegen import DifyApiError, NO_FIT_ERROR, execute_code, fetch_code_from_dify, load_sales_data, log
+from run_codegen import DifyApiError, execute_code, fetch_code_from_dify, load_sales_data, log
 from slack_notifier import async_notify as slack_notify
 
 
@@ -257,17 +257,19 @@ async def process_single(
             code = dify_result["playwright_code"]
             no_fit_reason = dify_result.get("no_fit_reason", "")
 
-            # フォームが見つからなかった場合はスキップ
+            # フォームが見つからなかった場合 or 不適合の場合はスキップ
             if code.startswith("ERROR:"):
                 result_row["status"] = "skip"
                 result_row["message"] = code
                 log(f"[{index}/{total}] スキップ: {code}", "WARN")
+                if no_fit_reason:
+                    log(f"[{index}/{total}] 理由: {no_fit_reason}", "WARN")
                 await slack_notify(
                     company_name=company_name,
                     contact_url=contact_url,
                     status=result_row["status"],
                     message=result_row["message"],
-                    no_fit_reason=no_fit_reason if code == NO_FIT_ERROR else "",
+                    no_fit_reason=no_fit_reason,
                     session=http_session,
                 )
                 return result_row
