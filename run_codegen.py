@@ -32,7 +32,6 @@ load_dotenv()
 
 DIFY_API_KEY = os.environ.get("DIFY_API_KEY", "")
 DIFY_BASE_URL = os.environ.get("DIFY_BASE_URL", "https://api.dify.ai/v1")
-NO_FIT_ERROR = "ERROR: Riskdogに関連する訴求ポイントが見つかりませんでした（該当業界または業務関連性なし）"
 
 
 class DifyApiError(Exception):
@@ -151,10 +150,25 @@ async def fetch_code_from_dify(
         raise DifyApiError("ワークフロー出力なし")
 
     playwright_code = outputs.get("playwright_code", "")
+    error_message = outputs.get("error_message", "")
     no_fit_reason = outputs.get("no_fit_reason", "")
+
+    # no_fit_reason がリストの場合は文字列に変換
+    if isinstance(no_fit_reason, list):
+        no_fit_reason = "、".join(str(r) for r in no_fit_reason)
+    elif isinstance(no_fit_reason, dict):
+        no_fit_reason = str(no_fit_reason)
+
     if not playwright_code:
-        log(f"{prefix}playwright_code が空です", "ERROR")
-        raise DifyApiError("playwright_code が空")
+        # Dify側のerror_messageがあればそれを使う（"ERROR:"で始まるのでスキップ扱いになる）
+        if error_message:
+            playwright_code = error_message
+            log(f"{prefix}{error_message}", "WARN")
+            if no_fit_reason:
+                log(f"{prefix}理由: {no_fit_reason}", "WARN")
+        else:
+            log(f"{prefix}playwright_code が空です", "ERROR")
+            raise DifyApiError("playwright_code が空")
 
     if playwright_code.startswith("ERROR:"):
         log(f"{prefix}{playwright_code}", "WARN")
@@ -663,7 +677,7 @@ async def async_main():
         code = dify_result["playwright_code"]
         no_fit_reason = dify_result.get("no_fit_reason", "")
 
-        # フォームが見つからなかった場合はスキップ
+        # フォームが見つからなかった場合 or 不適合の場合はスキップ
         if code.startswith("ERROR:"):
             result = {
                 "status": "skip",
@@ -676,11 +690,13 @@ async def async_main():
                 contact_url=args.contact_url or "",
                 status=result["status"],
                 message=result["message"],
-                no_fit_reason=no_fit_reason if code == NO_FIT_ERROR else "",
+                no_fit_reason=no_fit_reason,
             )
             print(f"\n--- 実行結果 ---")
             print(f"  ステータス: {result['status']}")
             print(f"  メッセージ: {result['message']}")
+            if no_fit_reason:
+                print(f"  理由: {no_fit_reason}")
             sys.exit(1)
 
         # コード保存オプション
