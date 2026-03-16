@@ -34,9 +34,10 @@ def _build_payload(
     text += f"• URL: {contact_url}\n"
     text += f"• ステータス: {status}\n"
     if message:
-        text += f"• メッセージ: {message}\n"
+        display_message = message.removeprefix("ERROR: ").removeprefix("ERROR:")
+        text += f"• メッセージ: {display_message}\n"
     if no_fit_reason:
-        text += f"• no_fit_reason: {no_fit_reason}\n"
+        text += f"• 理由: {no_fit_reason}\n"
     text += f"• 時刻: {now}"
 
     return {"text": text}
