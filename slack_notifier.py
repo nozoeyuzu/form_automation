@@ -22,6 +22,7 @@ def _build_payload(
     status: str,
     message: str = "",
     no_fit_reason: str = "",
+    final_body: str = "",
 ) -> dict:
     """Slack通知用のペイロードを組み立てる。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -38,6 +39,8 @@ def _build_payload(
         text += f"• メッセージ: {display_message}\n"
     if no_fit_reason:
         text += f"• 理由: {no_fit_reason}\n"
+    if final_body:
+        text += f"• 送信内容:\n{final_body}\n"
     text += f"• 時刻: {now}"
 
     return {"text": text}
@@ -49,12 +52,13 @@ def notify(
     status: str,
     message: str = "",
     no_fit_reason: str = "",
+    final_body: str = "",
 ) -> None:
     """フォーム送信結果をSlackに通知する（同期版）。
 
     try/exceptで囲んでいるため、通知エラーが起きてもメインフローは止まらない。
     """
-    payload = _build_payload(company_name, contact_url, status, message, no_fit_reason)
+    payload = _build_payload(company_name, contact_url, status, message, no_fit_reason, final_body)
 
     try:
         resp = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=10)
@@ -70,13 +74,14 @@ async def async_notify(
     status: str,
     message: str = "",
     no_fit_reason: str = "",
+    final_body: str = "",
     session: aiohttp.ClientSession | None = None,
 ) -> None:
     """フォーム送信結果をSlackに通知する（非同期版）。
 
     try/exceptで囲んでいるため、通知エラーが起きてもメインフローは止まらない。
     """
-    payload = _build_payload(company_name, contact_url, status, message, no_fit_reason)
+    payload = _build_payload(company_name, contact_url, status, message, no_fit_reason, final_body)
 
     own_session = session is None
     if own_session:
