@@ -209,6 +209,7 @@ async def process_single(
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 
+        final_body = ""
         try:
             # Step 0: フォームHTML取得（レンダリング有効時）
             contact_html = ""
@@ -256,6 +257,7 @@ async def process_single(
                 raise DifyApiError("コード取得に失敗しました")
             code = dify_result["playwright_code"]
             no_fit_reason = dify_result.get("no_fit_reason", "")
+            final_body = dify_result.get("final_body", "")
 
             # フォームが見つからなかった場合 or 不適合の場合はスキップ
             if code.startswith("ERROR:"):
@@ -319,6 +321,7 @@ async def process_single(
             contact_url=contact_url,
             status=result_row["status"],
             message=result_row["message"],
+            final_body=final_body if result_row["status"] == "ok" else "",
             session=http_session,
         )
 

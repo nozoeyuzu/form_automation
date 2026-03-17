@@ -152,6 +152,7 @@ async def fetch_code_from_dify(
     playwright_code = outputs.get("playwright_code", "")
     error_message = outputs.get("error_message", "")
     no_fit_reason = outputs.get("no_fit_reason", "")
+    final_body = outputs.get("final_body", "")
 
     # no_fit_reason がリストの場合は文字列に変換
     if isinstance(no_fit_reason, list):
@@ -176,6 +177,7 @@ async def fetch_code_from_dify(
     return {
         "playwright_code": playwright_code,
         "no_fit_reason": no_fit_reason,
+        "final_body": final_body,
     }
 
 
@@ -631,6 +633,8 @@ async def async_main():
     print("\n=== Playwright コード生成モード ===\n")
 
     # コード取得: ファイル or Dify API
+    no_fit_reason = ""
+    final_body = ""
     if args.file:
         log(f"ローカルファイルから読み込み: {args.file}")
         with open(args.file, "r", encoding="utf-8") as f:
@@ -676,6 +680,7 @@ async def async_main():
         )
         code = dify_result["playwright_code"]
         no_fit_reason = dify_result.get("no_fit_reason", "")
+        final_body = dify_result.get("final_body", "")
 
         # フォームが見つからなかった場合 or 不適合の場合はスキップ
         if code.startswith("ERROR:"):
@@ -727,6 +732,7 @@ async def async_main():
         contact_url=args.contact_url or "",
         status=result["status"],
         message=result["message"],
+        final_body=final_body if result["status"] == "ok" else "",
     )
 
     # 結果レポート
