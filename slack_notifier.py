@@ -11,6 +11,9 @@ import aiohttp
 import requests
 from dotenv import load_dotenv
 
+from airtable_notifier import async_notify as airtable_async_notify
+from airtable_notifier import notify as airtable_notify
+
 load_dotenv()
 
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
@@ -67,6 +70,8 @@ def notify(
     except Exception as e:
         print(f"  [!] Slack通知エラー: {e}")
 
+    airtable_notify(company_name=company_name, status=status)
+
 
 async def async_notify(
     company_name: str,
@@ -99,5 +104,12 @@ async def async_notify(
     except Exception as e:
         print(f"  [!] Slack通知エラー: {e}")
     finally:
-        if own_session:
-            await session.close()
+        try:
+            await airtable_async_notify(
+                company_name=company_name,
+                status=status,
+                session=session,
+            )
+        finally:
+            if own_session:
+                await session.close()
