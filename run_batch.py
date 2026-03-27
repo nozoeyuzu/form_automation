@@ -136,7 +136,27 @@ def write_report(results: list[dict], report_dir: str = "reports") -> str:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="CSVバッチ実行スクリプト")
-    parser.add_argument("csv_file", help="入力CSVファイルのパス")
+    parser.add_argument("csv_file", nargs="?", default=None, help="入力CSVファイルのパス（--source csv 時に必須）")
+    parser.add_argument(
+        "--source", choices=["csv", "airtable"], default="csv",
+        help="データソース（デフォルト: csv）",
+    )
+    parser.add_argument(
+        "--form", default=None,
+        help="フォーム種別（A, B, C）（Airtableモード時に必須）",
+    )
+    parser.add_argument(
+        "--limit", type=int, default=None,
+        help="取得件数の上限（Airtableモード時のみ有効）",
+    )
+    parser.add_argument(
+        "--retry", action="store_true", default=False,
+        help="エラーのレコードを再処理する（Airtableモード時のみ有効）",
+    )
+    parser.add_argument(
+        "--retry-all", action="store_true", default=False,
+        help="送信済み含む全レコードを再処理する（Airtableモード時のみ有効）",
+    )
     parser.add_argument(
         "--headed", action="store_true", default=False,
         help="ブラウザを表示する",
@@ -195,6 +215,7 @@ async def process_single(
         company_overview = row.get("company_overview", "")
         business_summary = row.get("business_summary", "")
         riskdog_industry = row.get("riskdog_industry", "")
+        airtable_record_id = row.get("_airtable_record_id", "")
 
         label = company_name or company_url
         log(f"[{index}/{total}] {label} 開始")
@@ -273,6 +294,7 @@ async def process_single(
                     message=result_row["message"],
                     no_fit_reason=no_fit_reason,
                     session=http_session,
+                    airtable_record_id=airtable_record_id,
                 )
                 return result_row
 
@@ -323,6 +345,7 @@ async def process_single(
             message=result_row["message"],
             final_body=final_body if result_row["status"] == "ok" else "",
             session=http_session,
+            airtable_record_id=airtable_record_id,
         )
 
         status_sym = "OK" if result_row["status"] == "ok" else "WARN"
@@ -417,9 +440,34 @@ def main():
 
     print("\n=== バッチ実行モード ===\n")
 
-    rows = read_csv(args.csv_file)
-    total = len(rows)
-    log(f"CSV読み込み完了: {total} 件")
+    if args.source == "airtable":
+        if not args.form:
+            log("Airtableモードでは --form の指定が必須です（例: --form A）", "ERROR")
+            sys.exit(1)
+
+        from airtable_reader import fetch_records
+
+        async def _fetch():
+            async with aiohttp.ClientSession() as session:
+                return await fetch_records(
+                    session=session,
+                    form_type=args.form,
+                    limit=args.limit,
+                    status_filter="all" if args.retry_all else ("error" if args.retry else "unsent"),
+                )
+
+        rows = asyncio.run(_fetch())
+        if not rows:
+            log("処理対象の行がありません", "ERROR")
+            sys.exit(1)
+        total = len(rows)
+    else:
+        if not args.csv_file:
+            log("CSVモードではCSVファイルのパスを指定してください", "ERROR")
+            sys.exit(1)
+        rows = read_csv(args.csv_file)
+        total = len(rows)
+        log(f"CSV読み込み完了: {total} 件")
 
     sales_data = load_sales_data(args.config)
     log(f"営業担当者データ読み込み完了: {args.config or 'config_example.json'}", "OK")
