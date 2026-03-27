@@ -13,8 +13,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY", "")
-AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "appcAG0TeOXanO3Id")
-AIRTABLE_TABLE_ID = os.getenv("AIRTABLE_TABLE_ID", "tbljPPJj1FuGLRhyG")
+AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "")
+AIRTABLE_TABLE_ID = os.getenv("AIRTABLE_TABLE_ID", "")
 
 
 def _build_headers() -> dict | None:
