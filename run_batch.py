@@ -26,7 +26,14 @@ import aiohttp
 from playwright.async_api import async_playwright
 
 from fetch_html import fetch_rendered_html
-from run_codegen import DifyApiError, execute_code, fetch_code_from_dify, load_sales_data, log
+from run_codegen import (
+    DifyApiError,
+    execute_code,
+    fetch_code_from_dify,
+    load_sales_data,
+    log,
+    resolve_form_type,
+)
 from slack_notifier import async_notify as slack_notify
 
 
@@ -173,6 +180,10 @@ def parse_args():
         "--workers", type=int, default=10,
         help="同時実行数（デフォルト: 10）",
     )
+    parser.add_argument(
+        "--form-type", choices=["A", "B"],
+        help="フォーム種別（A/B）。未指定時は実行時に選択",
+    )
     return parser.parse_args()
 
 
@@ -272,6 +283,7 @@ async def process_single(
                     status=result_row["status"],
                     message=result_row["message"],
                     no_fit_reason=no_fit_reason,
+                    form_type=args.form_type,
                     session=http_session,
                 )
                 return result_row
@@ -322,6 +334,7 @@ async def process_single(
             status=result_row["status"],
             message=result_row["message"],
             final_body=final_body if result_row["status"] == "ok" else "",
+            form_type=args.form_type,
             session=http_session,
         )
 
@@ -414,6 +427,7 @@ async def process_batch(args, rows, sales_data):
 
 def main():
     args = parse_args()
+    args.form_type = resolve_form_type(args.form_type or "")
 
     print("\n=== バッチ実行モード ===\n")
 

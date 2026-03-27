@@ -56,6 +56,19 @@ def load_sales_data(config_path: str = "") -> str:
         return f.read()
 
 
+def resolve_form_type(form_type: str = "") -> str:
+    """フォーム種別を返す。未指定なら対話入力で選ばせる。"""
+    normalized = form_type.strip().upper()
+    if normalized in {"A", "B"}:
+        return normalized
+
+    while True:
+        choice = input("フォーム種別を選択してください [A/B]: ").strip().upper()
+        if choice in {"A", "B"}:
+            return choice
+        print("A または B を入力してください。")
+
+
 async def fetch_code_from_dify(
     company_url: str,
     contact_url: str,
@@ -624,11 +637,16 @@ def parse_args():
         "--no-render", action="store_true", default=False,
         help="PlaywrightによるHTML事前レンダリングをスキップする（従来動作）",
     )
+    parser.add_argument(
+        "--form-type", choices=["A", "B"],
+        help="フォーム種別（A/B）。未指定時は実行時に選択",
+    )
     return parser.parse_args()
 
 
 async def async_main():
     args = parse_args()
+    args.form_type = resolve_form_type(args.form_type or "")
 
     print("\n=== Playwright コード生成モード ===\n")
 
@@ -696,6 +714,7 @@ async def async_main():
                 status=result["status"],
                 message=result["message"],
                 no_fit_reason=no_fit_reason,
+                form_type=args.form_type,
             )
             print(f"\n--- 実行結果 ---")
             print(f"  ステータス: {result['status']}")
@@ -733,6 +752,7 @@ async def async_main():
         status=result["status"],
         message=result["message"],
         final_body=final_body if result["status"] == "ok" else "",
+        form_type=args.form_type,
     )
 
     # 結果レポート
