@@ -43,17 +43,19 @@ def _build_filter_formula(company_name: str) -> str:
     return f"{{企業名}}='{_escape_formula_value(company_name)}'"
 
 
-def _build_update_payload(record_ids: list[str], status: str) -> dict:
+def _build_update_payload(
+    record_ids: list[str],
+    status: str,
+    final_body: str = "",
+) -> dict:
     """PATCH 用ペイロードを返す。"""
-    return {
-        "records": [
-            {
-                "id": record_id,
-                "fields": {"フォーム送信状況": status},
-            }
-            for record_id in record_ids
-        ]
-    }
+    records = []
+    for record_id in record_ids:
+        fields = {"フォーム送信状況": status}
+        if final_body:
+            fields["フォーム本文"] = final_body
+        records.append({"id": record_id, "fields": fields})
+    return {"records": records}
 
 
 def _find_matching_record_ids(
@@ -99,20 +101,28 @@ async def _find_matching_record_ids_async(
         return [record["id"] for record in body.get("records", [])]
 
 
-def notify(company_name: str, status: str) -> None:
+def notify(
+    company_name: str,
+    status: str,
+    record_id: str = "",
+    final_body: str = "",
+) -> None:
     """企業名一致の Airtable レコードを更新する（同期版）。"""
     headers = _build_headers()
-    if headers is None or not company_name:
+    if headers is None or (not company_name and not record_id):
         return
 
     try:
-        record_ids = _find_matching_record_ids(company_name, headers)
-        if not record_ids:
-            print(f"  [!] Airtable一致レコードなし: {company_name}")
-            return
+        if record_id:
+            record_ids = [record_id]
+        else:
+            record_ids = _find_matching_record_ids(company_name, headers)
+            if not record_ids:
+                print(f"  [!] Airtable一致レコードなし: {company_name}")
+                return
 
         url = _build_table_url()
-        payload = _build_update_payload(record_ids, status)
+        payload = _build_update_payload(record_ids, status, final_body)
         resp = requests.patch(url, headers=headers, json=payload, timeout=10)
         if resp.status_code >= 300:
             print(f"  [!] Airtable通知失敗 (HTTP {resp.status_code}): {resp.text}")
@@ -124,10 +134,12 @@ async def async_notify(
     company_name: str,
     status: str,
     session: aiohttp.ClientSession | None = None,
+    record_id: str = "",
+    final_body: str = "",
 ) -> None:
     """企業名一致の Airtable レコードを更新する（非同期版）。"""
     headers = _build_headers()
-    if headers is None or not company_name:
+    if headers is None or (not company_name and not record_id):
         return
 
     own_session = session is None
@@ -135,13 +147,18 @@ async def async_notify(
         session = aiohttp.ClientSession()
 
     try:
-        record_ids = await _find_matching_record_ids_async(company_name, headers, session)
-        if not record_ids:
-            print(f"  [!] Airtable一致レコードなし: {company_name}")
-            return
+        if record_id:
+            record_ids = [record_id]
+        else:
+            record_ids = await _find_matching_record_ids_async(
+                company_name, headers, session,
+            )
+            if not record_ids:
+                print(f"  [!] Airtable一致レコードなし: {company_name}")
+                return
 
         url = _build_table_url()
-        payload = _build_update_payload(record_ids, status)
+        payload = _build_update_payload(record_ids, status, final_body)
         async with session.patch(
             url,
             headers=headers,

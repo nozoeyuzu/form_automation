@@ -56,6 +56,7 @@ def notify(
     message: str = "",
     no_fit_reason: str = "",
     final_body: str = "",
+    airtable_record_id: str = "",
 ) -> None:
     """フォーム送信結果をSlackに通知する（同期版）。
 
@@ -70,7 +71,12 @@ def notify(
     except Exception as e:
         print(f"  [!] Slack通知エラー: {e}")
 
-    airtable_notify(company_name=company_name, status=status)
+    airtable_notify(
+        company_name=company_name,
+        status=status,
+        record_id=airtable_record_id,
+        final_body=final_body if status == "ok" else "",
+    )
 
 
 async def async_notify(
@@ -81,6 +87,7 @@ async def async_notify(
     no_fit_reason: str = "",
     final_body: str = "",
     session: aiohttp.ClientSession | None = None,
+    airtable_record_id: str = "",
 ) -> None:
     """フォーム送信結果をSlackに通知する（非同期版）。
 
@@ -109,6 +116,8 @@ async def async_notify(
                 company_name=company_name,
                 status=status,
                 session=session,
+                record_id=airtable_record_id,
+                final_body=final_body if status == "ok" else "",
             )
         finally:
             if own_session:
