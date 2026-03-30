@@ -26,6 +26,9 @@ TABLE_CAMPAIGN = "tblHAn3RGmqg6vUAr"
 TABLE_TARGETS = "tblvipFnhShnzbfW1"
 TABLE_RISKDOG = "tblQfOEB2vL3GFnq3"
 
+# ビューID（このビューのソート順でレコードを取得する）
+VIEW_TARGETS = "viwdtor8Ut1IeJlE8"
+
 # フォームタイプの短縮名 → キャンペーン名
 FORM_TYPE_MAP = {
     "A": "フォームA",
@@ -138,6 +141,7 @@ async def fetch_target_records(
         params = {
             "pageSize": 100,
             "filterByFormula": formula,
+            "view": VIEW_TARGETS,
         }
         if offset:
             params["offset"] = offset
