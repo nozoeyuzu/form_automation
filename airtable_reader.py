@@ -75,7 +75,7 @@ async def fetch_campaign_record_id(
     """キャンペーンマスタテーブルからキャンペーン名でrecord IDを取得する。"""
     url = _table_url(TABLE_CAMPAIGN)
     params = {
-        "filterByFormula": f"{{キャンペーン名}}='{_escape(campaign_name)}'",
+        "filterByFormula": f"FIND('{_escape(campaign_name)}',{{キャンペーン名}})",
         "pageSize": 1,
     }
 
@@ -119,7 +119,7 @@ async def fetch_target_records(
     """
     url = _table_url(TABLE_TARGETS)
     conditions = [
-        f"{{キャンペーンマスタ}}='{_escape(campaign_name)}'",
+        f"FIND('{_escape(campaign_name)}',{{キャンペーンマスタ}})",
         f"{{問い合わせURL}}!=''",
     ]
     if status_filter == "unsent":
